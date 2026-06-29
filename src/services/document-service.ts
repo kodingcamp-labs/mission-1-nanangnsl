@@ -1,47 +1,119 @@
-// Service layer prototipe — sumber utama keluhan tim.
-// Objektif 2 & 3: hilangkan N+1, perketat tipe, validasi input di boundary.
+// Service layer — hasil redesign (Objektif 2 & 3).
+//
+// Objektif 2: N+1 tiga tingkat diganti dengan 3 batch query (daftar dokumen,
+//   semua ekstraksi via WHERE document_id IN (...), semua review log via
+//   WHERE extraction_id IN (...)) lalu di-stitch in-memory pakai Map. Jumlah
+//   round-trip ke DB konstan (3), tidak tumbuh dengan jumlah dokumen.
+// Objektif 3: zero `any` — semua tipe eksplisit dari schema.ts/types.ts,
+//   input `ingestDocument` divalidasi Zod di boundary.
+
+import type { Document, Extraction, ReviewLog } from "../db/schema.js";
+import {
+  ingestDocumentSchema,
+  type IngestDocumentInput,
+  type IngestedDocument,
+  type DocumentWithExtractions,
+  type ExtractionWithLogs,
+  type ProcessResult,
+} from "../types.js";
 
 // Simulasi data store (di produksi: PostgreSQL via Drizzle).
+//
+// Catatan: di Drizzle nyata, tiga method di bawah berkorespondensi dengan:
+//   db.select().from(documents)
+//   db.select().from(extractions).where(inArray(extractions.documentId, ids))
+//   db.select().from(reviewLogs).where(inArray(reviewLogs.extractionId, ids))
+// — masing-masing SATU round-trip, apa pun jumlah barisnya.
 const fakeDb = {
-  async getDocumentIds(): Promise<number[]> {
-    return Array.from({ length: 50 }, (_, i) => i + 1);
+  async getAllDocuments(): Promise<Document[]> {
+    const now = new Date();
+    return Array.from({ length: 50 }, (_, i): Document => ({
+      id: i + 1,
+      fileName: `doc-${i + 1}.pdf`,
+      docType: "invoice",
+      status: "pending",
+      ownerEmail: "owner@example.com",
+      createdAt: now,
+      updatedAt: now,
+    }));
   },
-  async getDocumentById(id: number): Promise<any> {
-    return { id, fileName: `doc-${id}.pdf`, docType: "invoice", status: "pending" };
+
+  // Satu query untuk SEMUA dokumen sekaligus (WHERE document_id IN (...)).
+  async getExtractionsForDocuments(
+    documentIds: readonly number[],
+  ): Promise<Extraction[]> {
+    const now = new Date();
+    return documentIds.map((documentId): Extraction => ({
+      id: documentId,
+      documentId,
+      field: "total",
+      value: "1000000",
+      confidence: "0.9800",
+      raw: { currency: "IDR" },
+      createdAt: now,
+    }));
   },
-  async getExtractionsForDocument(docId: number): Promise<any[]> {
-    return [{ docId, field: "total", value: "1000000" }];
-  },
-  async getReviewLogsForExtraction(extraction: any): Promise<any[]> {
-    return [{ extractionId: extraction.docId, note: "ok" }];
+
+  // Satu query untuk SEMUA ekstraksi sekaligus (WHERE extraction_id IN (...)).
+  async getReviewLogsForExtractions(
+    extractionIds: readonly number[],
+  ): Promise<ReviewLog[]> {
+    const now = new Date();
+    return extractionIds.map((extractionId): ReviewLog => ({
+      id: extractionId,
+      extractionId,
+      reviewerEmail: "reviewer@example.com",
+      decision: "approved",
+      note: "ok",
+      createdAt: now,
+    }));
   },
 };
 
-// N+1 klasik tiga tingkat: 1 query daftar + N dokumen + N ekstraksi + N log.
-// Dengan 10.000 dokumen, ini ±30.001 round-trip ke database.
-export async function processAllDocuments(): Promise<any> {
-  const ids = await fakeDb.getDocumentIds();
-
-  const processed: any[] = [];
-  for (const id of ids) {
-    const doc: any = await fakeDb.getDocumentById(id);
-    const extractions: any = await fakeDb.getExtractionsForDocument(doc.id);
-    for (const ex of extractions) {
-      const logs: any = await fakeDb.getReviewLogsForExtraction(ex);
-      ex.logs = logs;
-    }
-    doc.extractions = extractions;
-    processed.push(doc);
+/** Mengelompokkan baris menjadi Map<key, baris[]> dalam satu lintasan. */
+function groupBy<T, K>(rows: readonly T[], keyOf: (row: T) => K): Map<K, T[]> {
+  const groups = new Map<K, T[]>();
+  for (const row of rows) {
+    const key = keyOf(row);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(row);
+    else groups.set(key, [row]);
   }
-
-  return { count: processed.length, documents: processed };
+  return groups;
 }
 
-// Input dari API eksternal — tidak divalidasi sama sekali. Perbaiki dengan Zod.
-export async function ingestDocument(payload: any): Promise<any> {
-  return {
-    fileName: payload.file_name,
-    docType: payload.type ?? payload.docType ?? "unknown",
-    ownerEmail: payload.email,
-  };
+// Tepat 3 round-trip ke DB, terlepas dari jumlah dokumen (bukan lagi 30.001).
+export async function processAllDocuments(): Promise<ProcessResult> {
+  // (1) Ambil semua dokumen.
+  const docs = await fakeDb.getAllDocuments();
+  const documentIds = docs.map((doc) => doc.id);
+
+  // (2) Ambil semua ekstraksi untuk seluruh dokumen dalam satu query.
+  const extractions = await fakeDb.getExtractionsForDocuments(documentIds);
+  const extractionIds = extractions.map((ex) => ex.id);
+
+  // (3) Ambil semua review log untuk seluruh ekstraksi dalam satu query.
+  const reviewLogs = await fakeDb.getReviewLogsForExtractions(extractionIds);
+
+  // Stitch in-memory: kelompokkan sekali, lalu rangkai pohon hasil.
+  const extractionsByDoc = groupBy(extractions, (ex) => ex.documentId);
+  const logsByExtraction = groupBy(reviewLogs, (log) => log.extractionId);
+
+  const documents: DocumentWithExtractions[] = docs.map((doc) => {
+    const docExtractions: ExtractionWithLogs[] = (
+      extractionsByDoc.get(doc.id) ?? []
+    ).map((ex) => ({
+      ...ex,
+      reviewLogs: logsByExtraction.get(ex.id) ?? [],
+    }));
+    return { ...doc, extractions: docExtractions };
+  });
+
+  return { count: documents.length, documents };
+}
+
+// Input dari API eksternal divalidasi di boundary — payload yang tidak valid
+// ditolak di sini, sebelum menyentuh logika domain.
+export function ingestDocument(payload: IngestDocumentInput): IngestedDocument {
+  return ingestDocumentSchema.parse(payload);
 }

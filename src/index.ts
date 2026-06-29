@@ -3,14 +3,15 @@
 // Tugas Anda: lihat README.md — rapikan arsitektur ini.
 
 import { processAllDocuments } from "./services/document-service.js";
+import type { ProcessResult } from "./types.js";
 
-async function main() {
+async function main(): Promise<void> {
   console.log("=== VLM Automation Pipeline ===");
-  const result: any = await processAllDocuments();
+  const result: ProcessResult = await processAllDocuments();
   console.log(`Selesai memproses ${result.count} dokumen.`);
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   console.error("pipeline crash:", err);
   process.exit(1);
 });
